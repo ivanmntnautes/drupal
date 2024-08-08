@@ -51,6 +51,11 @@ class TemporaryQueryGuard {
    */
   protected static $moduleHandler;
 
+
+
+  protected static $queryCache = [];
+
+
   /**
    * Sets the entity field manager.
    *
@@ -75,6 +80,8 @@ class TemporaryQueryGuard {
     static::$moduleHandler = $module_handler;
   }
 
+  
+
   /**
    * Applies access controls to an entity query.
    *
@@ -86,8 +93,6 @@ class TemporaryQueryGuard {
    *   Collects cacheability for the query.
    */
   public static function applyAccessControls(Filter $filter, QueryInterface $query, CacheableMetadata $cacheability) {
-    assert(static::$fieldManager !== NULL);
-    assert(static::$moduleHandler !== NULL);
     $filtered_fields = static::collectFilteredFields($filter->root());
     $field_specifiers = array_map(function ($field) {
       return explode('.', $field);
@@ -119,60 +124,118 @@ class TemporaryQueryGuard {
    * @see \Drupal\Core\Database\Query\AlterableInterface::addMetaData()
    * @see \Drupal\Core\Database\Query\ConditionInterface
    */
-  protected static function secureQuery(QueryInterface $query, $entity_type_id, array $tree, CacheableMetadata $cacheability, $field_prefix = NULL, ?FieldStorageDefinitionInterface $field_storage_definition = NULL) {
-    $entity_type = \Drupal::entityTypeManager()->getDefinition($entity_type_id);
-    // Config entity types are not fieldable, therefore they do not have field
-    // access restrictions, nor entity references to other entity types.
-    if ($entity_type instanceof ConfigEntityTypeInterface) {
-      return;
-    }
-    foreach ($tree as $specifier => $children) {
-      // The field path reconstructs the entity condition fields.
-      // E.g. `uid.0` would become `uid.0.name` if $specifier === 'name'.
-      $child_prefix = (is_null($field_prefix)) ? $specifier : "$field_prefix.$specifier";
-      if (is_null($field_storage_definition)) {
-        // When the field storage definition is NULL, this specifier is the
-        // first specifier in an entity query field path or the previous
-        // specifier was a data reference that has been traversed. In both
-        // cases, the specifier must be a field name.
-        $field_storage_definitions = static::$fieldManager->getFieldStorageDefinitions($entity_type_id);
-        static::secureQuery($query, $entity_type_id, $children, $cacheability, $child_prefix, $field_storage_definitions[$specifier]);
-        // When $field_prefix is NULL, this must be the first specifier in the
-        // entity query field path and a condition for the query's base entity
-        // type must be applied.
-        if (is_null($field_prefix)) {
-          static::applyAccessConditions($query, $entity_type_id, NULL, $cacheability);
+  protected static function secureQuery(QueryInterface $query, $entity_type_id, array $tree, CacheableMetadata $cacheability) {
+    // Implementing an iterative approach to avoid deep recursion
+    $stack = [['tree' => $tree, 'entity_type_id' => $entity_type_id, 'field_prefix' => NULL, 'field_storage_definition' => NULL]];
+    
+    // Using a while loop to process the stack
+    while (!empty($stack)) {
+      $current = array_pop($stack);
+      $current_tree = $current['tree'];
+      $current_entity_type_id = $current['entity_type_id'];
+      $current_field_prefix = $current['field_prefix'];
+      $current_field_storage_definition = $current['field_storage_definition'];
+
+      // Caching intermediate results
+      $cacheKey = md5(serialize([$current_entity_type_id, $current_tree, $current_field_prefix]));
+      
+      if (isset(static::$queryCache[$cacheKey])) {
+        $query->condition(static::$queryCache[$cacheKey]);
+        continue;
+      }
+
+      $entity_type = \Drupal::entityTypeManager()->getDefinition($current_entity_type_id);
+      // Config entity types are not fieldable, therefore they do not have field
+      // access restrictions, nor entity references to other entity types.
+      if ($entity_type instanceof ConfigEntityTypeInterface) {
+        continue;
+      }
+
+      $conditions = [];
+
+      foreach ($current_tree as $specifier => $children) {
+        // The field path reconstructs the entity condition fields.
+        // E.g. `uid.0` would become `uid.0.name` if $specifier === 'name'.
+        $child_prefix = (is_null($current_field_prefix)) ? $specifier : "$current_field_prefix.$specifier";
+        
+        if (is_null($current_field_storage_definition)) {
+          // When the field storage definition is NULL, this specifier is the
+          // first specifier in an entity query field path or the previous
+          // specifier was a data reference that has been traversed. In both
+          // cases, the specifier must be a field name.
+          $field_storage_definitions = static::$fieldManager->getFieldStorageDefinitions($current_entity_type_id);
+          $new_field_storage_definition = $field_storage_definitions[$specifier];
+          
+          // Nuovo commento: Aggiunta di elementi allo stack per l'elaborazione successiva
+          if (!empty($children)) {
+            $stack[] = [
+              'tree' => $children,
+              'entity_type_id' => $current_entity_type_id,
+              'field_prefix' => $child_prefix,
+              'field_storage_definition' => $new_field_storage_definition,
+            ];
+          }
+          
+          // When $field_prefix is NULL, this must be the first specifier in the
+          // entity query field path and a condition for the query's base entity
+          // type must be applied.
+          if (is_null($current_field_prefix)) {
+            $access_condition = static::getAccessCondition($current_entity_type_id, $cacheability);
+            if ($access_condition) {
+              $conditions[] = $access_condition;
+            }
+          }
+        } else {
+          // When the specifier is an entity reference, it can contain an entity
+          // type specifier, like so: `entity:node`. This extracts the `entity`
+          // portion. JSON:API will have already validated that the property
+          // exists.
+          $split_specifier = explode(':', $specifier, 2);
+          [$property_name, $target_entity_type_id] = array_merge($split_specifier, count($split_specifier) === 2 ? [] : [NULL]);
+          // The specifier is either a field property or a delta. If it is a data
+          // reference or a delta, then it needs to be traversed to the next
+          // specifier. However, if the specific is a simple field property, i.e.
+          // it is neither a data reference nor a delta, then there is no need to
+          // evaluate the remaining specifiers.
+          $property_definition = $current_field_storage_definition->getPropertyDefinition($property_name);
+          if ($property_definition instanceof DataReferenceDefinitionInterface) {
+            // Because the filter is following an entity reference, ensure
+            // access is respected on those targeted entities.
+            // Examples:
+            // - node_query_node_access_alter()
+            $target_entity_type_id = $target_entity_type_id ?: $current_field_storage_definition->getSetting('target_type');
+            $query->addTag("{$target_entity_type_id}_access");
+            $access_condition = static::getAccessCondition($target_entity_type_id, $cacheability);
+            if ($access_condition) {
+              $conditions[] = static::addConditionFieldPrefix($access_condition, $child_prefix);
+            }
+            
+            // Adding elements to the stack for further processing
+            if (!empty($children)) {
+              $stack[] = [
+                'tree' => $children,
+                'entity_type_id' => $target_entity_type_id,
+                'field_prefix' => $child_prefix,
+                'field_storage_definition' => NULL,
+              ];
+            }
+          } elseif (is_null($property_definition) && !empty($children)) {
+            assert(is_numeric($property_name), 'The specifier is not a property name, it must be a delta.');
+            $stack[] = [
+              'tree' => $children,
+              'entity_type_id' => $current_entity_type_id,
+              'field_prefix' => $child_prefix,
+              'field_storage_definition' => $current_field_storage_definition,
+            ];
+          }
         }
       }
-      else {
-        // When the specifier is an entity reference, it can contain an entity
-        // type specifier, like so: `entity:node`. This extracts the `entity`
-        // portion. JSON:API will have already validated that the property
-        // exists.
-        $split_specifier = explode(':', $specifier, 2);
-        [$property_name, $target_entity_type_id] = array_merge($split_specifier, count($split_specifier) === 2 ? [] : [NULL]);
-        // The specifier is either a field property or a delta. If it is a data
-        // reference or a delta, then it needs to be traversed to the next
-        // specifier. However, if the specific is a simple field property, i.e.
-        // it is neither a data reference nor a delta, then there is no need to
-        // evaluate the remaining specifiers.
-        $property_definition = $field_storage_definition->getPropertyDefinition($property_name);
-        if ($property_definition instanceof DataReferenceDefinitionInterface) {
-          // Because the filter is following an entity reference, ensure
-          // access is respected on those targeted entities.
-          // Examples:
-          // - node_query_node_access_alter()
-          $target_entity_type_id = $target_entity_type_id ?: $field_storage_definition->getSetting('target_type');
-          $query->addTag("{$target_entity_type_id}_access");
-          static::applyAccessConditions($query, $target_entity_type_id, $child_prefix, $cacheability);
-          // Keep descending the tree.
-          static::secureQuery($query, $target_entity_type_id, $children, $cacheability, $child_prefix);
-        }
-        elseif (is_null($property_definition)) {
-          assert(is_numeric($property_name), 'The specifier is not a property name, it must be a delta.');
-          // Keep descending the tree.
-          static::secureQuery($query, $entity_type_id, $children, $cacheability, $child_prefix, $field_storage_definition);
-        }
+
+      // Applying combined conditions and caching
+      if (!empty($conditions)) {
+        $combined_condition = count($conditions) > 1 ? new EntityConditionGroup('AND', $conditions) : $conditions[0];
+        $query->condition($combined_condition);
+        static::$queryCache[$cacheKey] = $combined_condition;
       }
     }
   }
